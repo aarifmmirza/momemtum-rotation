@@ -296,6 +296,21 @@ if len(data) < 5:
     st.error("Could not download enough data. Check your internet connection.")
     st.stop()
 
+# ---- Data Timestamp ----
+# Show when the price data is from and when the app last refreshed
+latest_date = None
+if "SPY" in data:
+    latest_date = data["SPY"].index[-1]
+now = datetime.now()
+if latest_date is not None:
+    st.caption(f"📡 Data as of: **{latest_date.strftime('%A, %B %d, %Y')}** market close "
+               f"&nbsp;|&nbsp; App refreshed: **{now.strftime('%I:%M %p %Z')}** "
+               f"({now.strftime('%m/%d/%Y')})"
+               f"&nbsp;|&nbsp; "
+               f"{'🟢 Market hours' if now.weekday() < 5 and 9 <= now.hour < 16 else '🔴 Market closed'}")
+else:
+    st.caption(f"📡 App refreshed: {now.strftime('%I:%M %p')} ({now.strftime('%m/%d/%Y')})")
+
 # ---- Market Filter ----
 spy_ok = spy_above_ma200(data)
 spy_price = get_price(data["SPY"]) if "SPY" in data else 0
