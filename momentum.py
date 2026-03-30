@@ -22,6 +22,9 @@ import numpy as np
 import json
 import os
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+ET = ZoneInfo("America/New_York")
 
 # ================================================================
 # CONFIGURATION
@@ -301,15 +304,15 @@ if len(data) < 5:
 latest_date = None
 if "SPY" in data:
     latest_date = data["SPY"].index[-1]
-now = datetime.now()
+now = datetime.now(ET)
 if latest_date is not None:
     st.caption(f"📡 Data as of: **{latest_date.strftime('%A, %B %d, %Y')}** market close "
-               f"&nbsp;|&nbsp; App refreshed: **{now.strftime('%I:%M %p %Z')}** "
+               f"&nbsp;|&nbsp; App refreshed: **{now.strftime('%I:%M %p')} ET** "
                f"({now.strftime('%m/%d/%Y')})"
                f"&nbsp;|&nbsp; "
                f"{'🟢 Market hours' if now.weekday() < 5 and 9 <= now.hour < 16 else '🔴 Market closed'}")
 else:
-    st.caption(f"📡 App refreshed: {now.strftime('%I:%M %p')} ({now.strftime('%m/%d/%Y')})")
+    st.caption(f"📡 App refreshed: {now.strftime('%I:%M %p')} ET ({now.strftime('%m/%d/%Y')})")
 
 # ---- Market Filter ----
 spy_ok = spy_above_ma200(data)
