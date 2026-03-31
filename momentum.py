@@ -68,6 +68,46 @@ CIRCUIT_BREAKER_PCT = 0.10   # 10% loss from entry → emergency sell
 GOVERNOR_THRESHOLD = 0.20    # 20% drawdown from peak → force 1x leverage
 
 PORTFOLIO_FILE = "rotation_portfolio.json"
+LOG_FILE = "rebalance_log.csv"
+
+
+def log_rebalance(action, holdings_list, spy_price, spy_ma, account_val,
+                  leverage, governor_active, spy_ok):
+    """Append a row to the rebalance log CSV. Auto-creates the file."""
+    import csv
+    now = datetime.now(ET)
+    file_exists = os.path.exists(LOG_FILE)
+
+    with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow([
+                "date", "time_et", "action", "account_value",
+                "spy_price", "spy_ma200", "spy_above_ma",
+                "leverage", "governor_active",
+                "pos1", "pos1_price",
+                "pos2", "pos2_price",
+                "pos3", "pos3_price",
+                "pos4", "pos4_price",
+                "pos5", "pos5_price",
+            ])
+
+        # Pad holdings list to 5 entries
+        padded = holdings_list + [("SHY", 0.0)] * (5 - len(holdings_list))
+        row = [
+            now.strftime("%Y-%m-%d"),
+            now.strftime("%I:%M %p ET"),
+            action,
+            f"{account_val:.0f}",
+            f"{spy_price:.2f}",
+            f"{spy_ma:.2f}",
+            "YES" if spy_ok else "NO",
+            leverage,
+            "YES" if governor_active else "NO",
+        ]
+        for tk, price in padded[:5]:
+            row.extend([tk, f"{price:.2f}"])
+        writer.writerow(row)
 
 
 # ================================================================
@@ -589,6 +629,9 @@ with tab_check:
                 new_val = calc_portfolio_value(updated, data)
                 check_governor(portfolio, new_val)
                 save_portfolio(portfolio)
+                log_rebalance("EMERGENCY_SELL",
+                    [(tk, get_price(data[tk])) for tk in updated if tk != CASH_PROXY and tk in data],
+                    spy_price, spy_ma, new_val, effective_leverage, governor_active, spy_ok)
                 st.success("Updated! Sold positions parked in SHY.")
                 st.rerun()
 
@@ -637,6 +680,8 @@ with tab_rebalance:
             new_val = calc_portfolio_value(portfolio["holdings"], data)
             check_governor(portfolio, new_val)
             save_portfolio(portfolio)
+            log_rebalance("BEAR_CASH", [("SHY", shy_price)],
+                spy_price, spy_ma, new_val, effective_leverage, governor_active, spy_ok)
             st.success("Saved! 100% in SHY. Check back next week.")
             st.rerun()
 
@@ -810,6 +855,9 @@ with tab_rebalance:
             check_governor(portfolio, new_val)
 
             save_portfolio(portfolio)
+            log_rebalance("REBALANCE",
+                [(pick["buy_ticker"], pick["price"]) for pick in selected],
+                spy_price, spy_ma, new_val, effective_leverage, governor_active, spy_ok)
             next_fri = datetime.now() + timedelta(days=(4 - datetime.now().weekday()) % 7 or 7)
             st.success(f"Saved! Next rebalance: {next_fri.strftime('%A, %B %d')}")
             st.rerun()
