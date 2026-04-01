@@ -7,9 +7,9 @@ STRATEGY (backtested 1999-2026, 19-20% CAGR, ~25% max drawdown):
   - Rank 17 global assets by momentum every Friday
   - Buy top 5 with positive momentum above MA200
   - Use 2x leveraged ETFs for broad/alt assets, 1x for sectors
-  - If SPY below MA200 → 100% cash (SHY)
+  - If SPY below MA200 → 100% cash (SPAXX)
   - If portfolio drawdown hits 20% → drop to 1x until new high
-  - If any position down 10% from entry → emergency sell to SHY
+  - If any position down 10% from entry → emergency sell to SPAXX
 
 LAUNCH:  streamlit run momentum.py
          (or double-click run_momentum.bat)
@@ -57,7 +57,7 @@ ASSETS = {
     "XLU":  ("Utilities",         "💡", None),
 }
 
-CASH_PROXY = "SHY"
+CASH_PROXY = "SPAXX"     # Money market fund, always $1.00/share
 TOP_N = 5
 LOOKBACK_FAST = 63     # 3 months trading days
 LOOKBACK_SLOW = 126    # 6 months trading days
@@ -93,7 +93,7 @@ def log_rebalance(action, holdings_list, spy_price, spy_ma, account_val,
             ])
 
         # Pad holdings list to 5 entries
-        padded = holdings_list + [("SHY", 0.0)] * (5 - len(holdings_list))
+        padded = holdings_list + [("SPAXX", 0.0)] * (5 - len(holdings_list))
         row = [
             now.strftime("%Y-%m-%d"),
             now.strftime("%I:%M %p ET"),
@@ -116,8 +116,8 @@ def log_rebalance(action, holdings_list, spy_price, spy_ma, account_val,
 
 @st.cache_data(ttl=1800)  # Cache 30 minutes
 def load_data():
-    """Download ~14 months of data for all assets + SPY for MA200."""
-    tickers = list(ASSETS.keys()) + [CASH_PROXY]
+    """Download ~14 months of data for all assets."""
+    tickers = list(ASSETS.keys())
     tickers = list(set(tickers))
     end = datetime.now()
     start = end - timedelta(days=450)
@@ -204,17 +204,19 @@ def save_portfolio(p):
 
 
 def calc_portfolio_value(holdings, data):
-    """Calculate true portfolio value from shares × current price."""
+    """Calculate true portfolio value from shares × current price.
+    SPAXX (money market) is always valued at the stored dollar amount."""
     total = 0.0
     for tk, info in holdings.items():
-        shares = info.get("shares", 0)
-        if shares and tk in data:
-            total += shares * get_price(data[tk])
-        elif shares and tk == CASH_PROXY and CASH_PROXY in data:
-            total += shares * get_price(data[CASH_PROXY])
-        elif not shares and info.get("amount"):
-            # Fallback for old format (dollar amounts without shares)
-            total += info["amount"]
+        if tk == CASH_PROXY:
+            # SPAXX is cash — always worth the stored dollar amount
+            total += info.get("amount", 0)
+        else:
+            shares = info.get("shares", 0)
+            if shares and tk in data:
+                total += shares * get_price(data[tk])
+            elif info.get("amount"):
+                total += info["amount"]
     return total
 
 
@@ -492,7 +494,7 @@ with tab_check:
                     SPY: ${spy_price:.2f} &nbsp;|&nbsp; MA200: ${spy_ma:.2f}
                 </div>
                 <div style="font-size: 14px; margin-top: 10px; color: #ff9999;">
-                    <b>ACTION:</b> Sell ALL positions immediately. Move everything to SHY.
+                    <b>ACTION:</b> Sell ALL positions immediately. Move everything to SPAXX.
                     Do NOT wait for weekly rebalance.
                 </div>
             </div>
@@ -551,7 +553,7 @@ with tab_check:
                         &nbsp;|&nbsp; Loss: ${gain_loss:,.0f}
                     </div>
                     <div style="font-size: 13px; margin-top: 8px; color: #ff9999;">
-                        <b>ACTION:</b> Sell {lev_tk} now. Park in SHY until next rebalance.
+                        <b>ACTION:</b> Sell {lev_tk} now. Park in SPAXX until next rebalance.
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
@@ -591,7 +593,7 @@ with tab_check:
         # Emergency sell button
         if any_tripped or not spy_ok:
             st.divider()
-            st.warning("⚠️ After selling, park proceeds in **SHY**. Do NOT rebuy until next rebalance.")
+            st.warning("⚠️ After selling, park proceeds in **SPAXX**. Do NOT rebuy until next rebalance.")
             if st.button("✅ I've sold the flagged positions", type="primary", key="emergency_sell"):
                 updated = {}
                 sold_amount = 0
@@ -613,12 +615,11 @@ with tab_check:
 
                 if sold_amount > 0:
                     existing = updated.get(CASH_PROXY, {})
-                    old_shares = existing.get("shares", 0)
-                    shy_price = get_price(data[CASH_PROXY]) if CASH_PROXY in data else 1
-                    new_shy_shares = old_shares + sold_amount / shy_price
+                    old_amount = existing.get("amount", 0)
+                    new_amount = old_amount + sold_amount
                     updated[CASH_PROXY] = {
-                        "shares": new_shy_shares,
-                        "amount": new_shy_shares * shy_price,
+                        "shares": new_amount,
+                        "amount": new_amount,
                         "entry_price": None,
                         "leveraged_ticker": CASH_PROXY,
                         "entry_date": datetime.now().strftime("%Y-%m-%d"),
@@ -632,7 +633,7 @@ with tab_check:
                 log_rebalance("EMERGENCY_SELL",
                     [(tk, get_price(data[tk])) for tk in updated if tk != CASH_PROXY and tk in data],
                     spy_price, spy_ma, new_val, effective_leverage, governor_active, spy_ok)
-                st.success("Updated! Sold positions parked in SHY.")
+                st.success("Updated! Sold positions parked in SPAXX.")
                 st.rerun()
 
 
@@ -653,25 +654,24 @@ with tab_rebalance:
         """, unsafe_allow_html=True)
 
     if not spy_ok:
-        st.error("🚨 SPY is below its 200-day MA. **GO TO 100% CASH (SHY).** "
+        st.error("🚨 SPY is below its 200-day MA. **GO TO 100% CASH (SPAXX).** "
                  "No new positions until SPY recovers above MA200.")
         st.markdown(f"""
         <div class="sell-signal">
-            <div class="action-header" style="color: #F44336;">SELL EVERYTHING → SHY</div>
-            <div class="amount-big">${account_size:,.0f} → SHY</div>
+            <div class="action-header" style="color: #F44336;">SELL EVERYTHING → SPAXX</div>
+            <div class="amount-big">${account_size:,.0f} → SPAXX</div>
             <div style="color: #888; font-size: 13px;">
                 SPY: ${spy_price:.2f} | MA200: ${spy_ma:.2f} | Market filter: BEAR
             </div>
         </div>
         """, unsafe_allow_html=True)
 
-        if st.button("✅ I've moved everything to SHY", type="primary", key="bear_save"):
-            shy_price = get_price(data[CASH_PROXY]) if CASH_PROXY in data else 1
+        if st.button("✅ I've moved everything to SPAXX", type="primary", key="bear_save"):
             portfolio["holdings"] = {
                 CASH_PROXY: {
-                    "shares": account_size / shy_price,
+                    "shares": account_size,
                     "amount": account_size,
-                    "entry_price": shy_price,
+                    "entry_price": None,
                     "leveraged_ticker": CASH_PROXY,
                     "entry_date": datetime.now().strftime("%Y-%m-%d"),
                 }
@@ -680,16 +680,16 @@ with tab_rebalance:
             new_val = calc_portfolio_value(portfolio["holdings"], data)
             check_governor(portfolio, new_val)
             save_portfolio(portfolio)
-            log_rebalance("BEAR_CASH", [("SHY", shy_price)],
+            log_rebalance("BEAR_CASH", [("SPAXX", 1.0)],
                 spy_price, spy_ma, new_val, effective_leverage, governor_active, spy_ok)
-            st.success("Saved! 100% in SHY. Check back next week.")
+            st.success("Saved! 100% in SPAXX. Check back next week.")
             st.rerun()
 
     else:
         # Show picks
         if not selected:
             st.warning("⚠️ No assets have positive momentum above MA200. "
-                       "Recommendation: 100% CASH (SHY)")
+                       "Recommendation: 100% CASH (SPAXX)")
         else:
             cols = st.columns(min(len(selected), 5))
             for i, pick in enumerate(selected):
@@ -727,7 +727,7 @@ with tab_rebalance:
 
         if cash_slots > 0:
             cash_amount = account_size * cash_weight
-            st.warning(f"⚠️ {cash_slots} slot(s) → **SHY (Cash)** — ${cash_amount:,.0f}. "
+            st.warning(f"⚠️ {cash_slots} slot(s) → **SPAXX (Cash)** — ${cash_amount:,.0f}. "
                        f"Not enough assets passed filters.")
 
         # ---- Action Items ----
@@ -759,7 +759,7 @@ with tab_rebalance:
                 st.markdown(f"""
                 <div class="hold-signal">
                     <div class="action-header" style="color: #2196F3;">BUY</div>
-                    <div class="ticker-big">SHY</div>
+                    <div class="ticker-big">SPAXX</div>
                     <div style="color: #888;">Cash (Short-term Treasuries)</div>
                     <div class="amount-big">${account_size * cash_weight:,.0f}</div>
                 </div>
@@ -835,11 +835,10 @@ with tab_rebalance:
                 }
             if cash_slots > 0:
                 cash_amt = account_size * cash_weight
-                shy_price = get_price(data[CASH_PROXY]) if CASH_PROXY in data else 1
                 saved[CASH_PROXY] = {
-                    "shares": cash_amt / shy_price,
+                    "shares": cash_amt,
                     "amount": cash_amt,
-                    "entry_price": shy_price,
+                    "entry_price": None,
                     "leveraged_ticker": CASH_PROXY,
                     "entry_date": datetime.now().strftime("%Y-%m-%d"),
                 }
@@ -891,7 +890,7 @@ with tab_rebalance:
         **The rules:**
         1. Rank all 17 assets by momentum (60% × 3mo + 40% × 6mo return)
         2. Pick the top 5 with POSITIVE momentum AND above 200-day MA
-        3. If SPY is below its 200-day MA → 100% cash (SHY), skip everything
+        3. If SPY is below its 200-day MA → 100% cash (SPAXX), skip everything
         4. Equal weight: 20% of account per position (${account_size/5:,.0f} each)
         5. Broad assets (SPY, QQQ, IWM, GLD, TLT, EFA, EEM, VNQ) use 2x leveraged ETFs
         6. Sector ETFs (XLK, XLF, XLE, etc.) stay at 1x — thin leveraged products
