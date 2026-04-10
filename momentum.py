@@ -546,17 +546,49 @@ with tab_check:
                 """, unsafe_allow_html=True)
         else:
             pct_above = (spy_price - spy_ma) / spy_ma * 100 if spy_ma > 0 else 0
-            st.markdown(f"""
-            <div class="hold-signal">
-                <div class="action-header" style="color: #4CAF50;">
-                    ✅ SPY ABOVE 200-DAY MA — Market trend OK
+            # Check if user is transitioning from bear to bull
+            status_held = set(current_holdings.keys()) - {CASH_PROXY}
+            status_transitioning = status_held.issubset(set(SAFE_HAVENS)) and len(status_held) > 0
+            status_is_friday = datetime.now(ET).weekday() == 4
+
+            if status_transitioning and not status_is_friday:
+                st.markdown(f"""
+                <div class="governor-warn">
+                    <div class="action-header" style="color: #FF9800;">
+                        ⏳ SPY CROSSED ABOVE MA200 — WAIT FOR FRIDAY TO SWITCH
+                    </div>
+                    <div style="font-size: 14px; margin-top: 5px;">
+                        SPY: ${spy_price:.2f} &nbsp;|&nbsp; MA200: ${spy_ma:.2f}
+                        &nbsp;|&nbsp; {pct_above:+.1f}% above.
+                        Hold {', '.join(status_held)} until Friday to confirm this isn't a false crossover.
+                    </div>
                 </div>
-                <div style="font-size: 14px; margin-top: 5px;">
-                    SPY: ${spy_price:.2f} &nbsp;|&nbsp; MA200: ${spy_ma:.2f}
-                    &nbsp;|&nbsp; {pct_above:+.1f}% above
+                """, unsafe_allow_html=True)
+            elif status_transitioning and status_is_friday:
+                st.markdown(f"""
+                <div class="buy-signal">
+                    <div class="action-header" style="color: #4CAF50;">
+                        🟢 BULL MODE CONFIRMED — SWITCH TO FULL PORTFOLIO TODAY
+                    </div>
+                    <div style="font-size: 14px; margin-top: 5px;">
+                        SPY: ${spy_price:.2f} &nbsp;|&nbsp; MA200: ${spy_ma:.2f}
+                        &nbsp;|&nbsp; {pct_above:+.1f}% above.
+                        Go to the Weekly Rebalance tab to see your 5 picks and execute.
+                    </div>
                 </div>
-            </div>
-            """, unsafe_allow_html=True)
+                """, unsafe_allow_html=True)
+            else:
+                st.markdown(f"""
+                <div class="hold-signal">
+                    <div class="action-header" style="color: #4CAF50;">
+                        ✅ SPY ABOVE 200-DAY MA — Market trend OK
+                    </div>
+                    <div style="font-size: 14px; margin-top: 5px;">
+                        SPY: ${spy_price:.2f} &nbsp;|&nbsp; MA200: ${spy_ma:.2f}
+                        &nbsp;|&nbsp; {pct_above:+.1f}% above
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
         st.write("")
 
         # --- Per-position circuit breakers ---
@@ -789,6 +821,35 @@ with tab_rebalance:
                 st.rerun()
 
     else:
+        # Check if transitioning from bear to bull (holding safe haven, now in bull mode)
+        held_tickers = set(current_holdings.keys()) - {CASH_PROXY}
+        transitioning_from_bear = held_tickers.issubset(set(SAFE_HAVENS)) and len(held_tickers) > 0
+        is_friday = datetime.now(ET).weekday() == 4  # 4 = Friday
+
+        if transitioning_from_bear and not is_friday:
+            days_until_friday = (4 - datetime.now(ET).weekday()) % 7
+            if days_until_friday == 0:
+                days_until_friday = 7
+            st.markdown(f"""
+            <div class="governor-warn">
+                <div class="action-header" style="color: #FF9800; font-size: 16px;">
+                    ⏳ REGIME CHANGE DETECTED — WAIT FOR FRIDAY
+                </div>
+                <div style="font-size: 14px; margin-top: 8px;">
+                    SPY just crossed above MA200 — bull mode is activating.
+                    But <b>do NOT trade today.</b> Hold your current safe haven position
+                    ({', '.join(held_tickers)}) until Friday to confirm the crossover is real.
+                    SPY can easily dip back below MA200 in the next {days_until_friday} day(s).
+                    If it's still above on Friday, execute the trades below.
+                </div>
+                <div style="font-size: 13px; margin-top: 8px; color: #FF9800;">
+                    SPY: ${spy_price:.2f} | MA200: ${spy_ma:.2f} |
+                    Above by: {((spy_price - spy_ma) / spy_ma * 100):.2f}%
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            st.write("")
+
         # Show picks
         if not selected:
             st.warning("⚠️ No assets have positive momentum above MA200. "
@@ -847,6 +908,18 @@ with tab_rebalance:
         buys = new_tks - old_tks
         holds = old_tks & new_tks
 
+        # Detect leverage swaps (e.g., GLD 1x → UGL 2x or vice versa)
+        leverage_swaps = set()
+        true_holds = set()
+        for tk in holds:
+            old_lev_tk = current_holdings.get(tk, {}).get("leveraged_ticker", tk)
+            new_pick = new_tickers.get(tk)
+            new_lev_tk = new_pick["buy_ticker"] if new_pick else tk
+            if old_lev_tk != new_lev_tk:
+                leverage_swaps.add(tk)
+            else:
+                true_holds.add(tk)
+
         if not current_holdings:
             st.info("First rebalance — buy all positions below:")
             for pick in selected:
@@ -867,7 +940,7 @@ with tab_rebalance:
                     <div class="amount-big">${account_size * cash_weight:,.0f}</div>
                 </div>
                 """, unsafe_allow_html=True)
-        elif not sells and not buys:
+        elif not sells and not buys and not leverage_swaps:
             # Check if leverage changed (governor toggled)
             st.success("✅ **Same positions as last week.** No trades needed.")
             if governor_active:
@@ -876,7 +949,8 @@ with tab_rebalance:
         else:
             action_cols = st.columns(2)
             with action_cols[0]:
-                if sells:
+                has_sells = bool(sells) or bool(leverage_swaps)
+                if sells or leverage_swaps:
                     for tk in sells:
                         name = ASSETS.get(tk, (tk, "", None))[0]
                         old_lev = current_holdings.get(tk, {}).get("leveraged_ticker", tk)
@@ -887,11 +961,23 @@ with tab_rebalance:
                             <div style="color: #888;">{name}</div>
                         </div>
                         """, unsafe_allow_html=True)
+                    for tk in leverage_swaps:
+                        name = ASSETS.get(tk, (tk, "", None))[0]
+                        old_lev = current_holdings.get(tk, {}).get("leveraged_ticker", tk)
+                        new_pick = new_tickers.get(tk)
+                        new_lev = new_pick["buy_ticker"] if new_pick else tk
+                        st.markdown(f"""
+                        <div class="sell-signal">
+                            <div class="action-header" style="color: #FF9800;">SWAP — SELL</div>
+                            <div class="ticker-big">{old_lev} → {new_lev}</div>
+                            <div style="color: #888;">{name} — switching from {old_lev} (bear mode) to {new_lev} (bull mode)</div>
+                        </div>
+                        """, unsafe_allow_html=True)
                 else:
                     st.success("Nothing to sell")
 
             with action_cols[1]:
-                if buys:
+                if buys or leverage_swaps:
                     for tk in buys:
                         pick = new_tickers.get(tk)
                         if pick:
@@ -903,12 +989,23 @@ with tab_rebalance:
                                 <div class="amount-big">${per_position:,.0f}</div>
                             </div>
                             """, unsafe_allow_html=True)
+                    for tk in leverage_swaps:
+                        pick = new_tickers.get(tk)
+                        if pick:
+                            st.markdown(f"""
+                            <div class="buy-signal">
+                                <div class="action-header" style="color: #FF9800;">SWAP — BUY</div>
+                                <div class="ticker-big">{pick['buy_ticker']}</div>
+                                <div style="color: #888;">{pick['name']} ({pick['lev_label']}) — replacing bear mode position</div>
+                                <div class="amount-big">${per_position:,.0f}</div>
+                            </div>
+                            """, unsafe_allow_html=True)
                 else:
                     st.success("Nothing to buy")
 
-            if holds:
+            if true_holds:
                 st.markdown("**HOLD (no change):**")
-                for tk in holds:
+                for tk in true_holds:
                     pick = new_tickers.get(tk)
                     name = ASSETS.get(tk, (tk, "", None))[0]
                     lev_tk = pick["buy_ticker"] if pick else tk
