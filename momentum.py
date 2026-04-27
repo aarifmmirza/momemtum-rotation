@@ -267,24 +267,29 @@ st.markdown("""
         padding: 18px;
         text-align: center;
         margin: 5px 0;
+        color: #e0e0e0;
     }
-    .ticker-big { font-size: 32px; font-weight: bold; }
+    .ticker-big { font-size: 32px; font-weight: bold; color: #ffffff; }
     .amount-big { font-size: 26px; font-weight: bold; color: #64B5F6; }
     .buy-signal {
         background: linear-gradient(135deg, #1a3a1a 0%, #1a4a1a 100%);
         border: 2px solid #4CAF50; border-radius: 12px; padding: 18px; margin: 8px 0;
+        color: #e0e0e0;
     }
     .sell-signal {
         background: linear-gradient(135deg, #3a1a1a 0%, #4a1a1a 100%);
         border: 2px solid #F44336; border-radius: 12px; padding: 18px; margin: 8px 0;
+        color: #e0e0e0;
     }
     .hold-signal {
         background: linear-gradient(135deg, #1a2a3a 0%, #1a3a4a 100%);
         border: 2px solid #2196F3; border-radius: 12px; padding: 18px; margin: 8px 0;
+        color: #e0e0e0;
     }
     .governor-warn {
         background: linear-gradient(135deg, #3a2a1a 0%, #4a3a1a 100%);
         border: 2px solid #FF9800; border-radius: 12px; padding: 18px; margin: 8px 0;
+        color: #e0e0e0;
     }
     .action-header { font-size: 14px; font-weight: bold; letter-spacing: 2px; margin-bottom: 5px; }
     div[data-testid="stExpander"] { border: 1px solid #0f3460; border-radius: 10px; }
@@ -463,7 +468,7 @@ if not spy_ok:
 # TABS
 # ================================================================
 
-tab_check, tab_rebalance = st.tabs(["🚨 Status Check", "📊 Weekly Rebalance"])
+tab_check, tab_rebalance, tab_edit = st.tabs(["🚨 Status Check", "📊 Weekly Rebalance", "✏️ Edit Holdings"])
 
 # ================================================================
 # TAB 1: STATUS CHECK (daily/weekly)
@@ -897,6 +902,31 @@ with tab_rebalance:
         # ---- Action Items ----
         st.header("🎯 What To Do")
 
+        is_rebalance_day = datetime.now(ET).weekday() == 4  # Friday
+
+        if not is_rebalance_day and current_holdings:
+            days_to_friday = (4 - datetime.now(ET).weekday()) % 7
+            if days_to_friday == 0:
+                days_to_friday = 7
+            st.markdown(f"""
+            <div class="governor-warn">
+                <div class="action-header" style="color: #FF9800; font-size: 16px;">
+                    📅 NOT REBALANCE DAY — DO NOT TRADE
+                </div>
+                <div style="font-size: 14px; margin-top: 8px;">
+                    Today is {datetime.now(ET).strftime('%A')}. Rebalancing only happens on <b>Fridays</b>.
+                    The picks below are a <b>preview</b> of what the portfolio would look like
+                    if you rebalanced today — but rankings change daily. Wait {days_to_friday} day(s)
+                    and check again Friday.
+                    <br><br>
+                    <b>The only mid-week actions:</b> sell if a circuit breaker trips (10% loss)
+                    or if SPY drops below MA200.
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            st.write("")
+            st.markdown("**📋 Preview of current rankings (do NOT act on these today):**")
+
         new_tickers = {pick["ticker"]: pick for pick in selected}
         if cash_slots > 0:
             new_tickers[CASH_PROXY] = None
@@ -1019,7 +1049,13 @@ with tab_rebalance:
 
         # ---- Save Button ----
         st.divider()
-        if st.button("✅ I've made the trades — Save holdings", type="primary", key="save_rebal"):
+        if not is_rebalance_day and current_holdings:
+            st.info("💡 Rebalancing normally happens on Fridays.")
+            override = st.checkbox("I missed Friday — allow me to save today's trades")
+        else:
+            override = True
+
+        if (is_rebalance_day or override) and st.button("✅ I've made the trades — Save holdings", type="primary", key="save_rebal"):
             saved = {}
             for pick in selected:
                 tk = pick["ticker"]
@@ -1132,3 +1168,170 @@ with tab_rebalance:
         - Past performance does not guarantee future results
         - This is a tool for your own decision-making, not financial advice
         """)
+
+# ================================================================
+# TAB 3: EDIT HOLDINGS
+# ================================================================
+with tab_edit:
+    st.header("✏️ Edit Holdings")
+    st.caption("Use this to fix a missed rebalance, correct an entry price, or sync the app after a manual trade.")
+
+    edit_portfolio = load_portfolio()
+    edit_holdings = edit_portfolio.get("holdings", {})
+
+    # ---- Remove a position ----
+    st.subheader("🗑️ Remove a Position")
+    st.write("Use this when you sold a position and need to remove it from the app.")
+
+    positions_to_remove = [tk for tk in edit_holdings.keys() if tk != CASH_PROXY]
+    if not positions_to_remove:
+        st.info("No positions saved. Nothing to remove.")
+    else:
+        remove_labels = {}
+        for tk in positions_to_remove:
+            lev_tk = edit_holdings[tk].get("leveraged_ticker", tk)
+            name = ASSETS.get(tk, (tk, "", None))[0]
+            remove_labels[f"{lev_tk} ({name})"] = tk
+
+        remove_choice = st.selectbox("Which position did you sell?", list(remove_labels.keys()), key="remove_select")
+        if st.button("🗑️ Remove this position", key="remove_btn"):
+            tk_to_remove = remove_labels[remove_choice]
+            del edit_portfolio["holdings"][tk_to_remove]
+            save_portfolio(edit_portfolio)
+            st.success(f"Removed {remove_choice} from your holdings.")
+            st.rerun()
+
+    st.divider()
+
+    # ---- Add a new position ----
+    st.subheader("➕ Add a New Position")
+    st.write("Use this when you bought a new position and need to record it in the app.")
+
+    all_base_tickers = list(ASSETS.keys())
+    existing_tickers = list(edit_holdings.keys())
+    available_to_add = [tk for tk in all_base_tickers if tk not in existing_tickers]
+
+    if not available_to_add:
+        st.info("All tracked positions already saved.")
+    else:
+        add_labels = {}
+        for tk in available_to_add:
+            info = ASSETS[tk]
+            lev_tk = info[2] if info[2] else tk
+            add_labels[f"{lev_tk} — {info[0]}"] = tk
+
+        add_choice = st.selectbox("What did you buy?", list(add_labels.keys()), key="add_select")
+        add_base_tk = add_labels[add_choice]
+        add_info = ASSETS[add_base_tk]
+        add_lev_tk = add_info[2] if add_info[2] else add_base_tk
+
+        add_col1, add_col2 = st.columns(2)
+        with add_col1:
+            add_entry_price = st.number_input(
+                f"Entry price for {add_lev_tk} ($)",
+                min_value=0.01, max_value=100000.0,
+                value=float(get_price(data[add_base_tk])) if add_base_tk in data else 100.0,
+                step=0.01, key="add_price"
+            )
+        with add_col2:
+            add_amount = st.number_input(
+                "Dollar amount invested ($)",
+                min_value=1.0, max_value=1000000.0,
+                value=float(edit_portfolio.get("account_size", 6000) / TOP_N),
+                step=1.0, key="add_amount"
+            )
+
+        if st.button(f"➕ Add {add_lev_tk} to holdings", type="primary", key="add_btn"):
+            edit_portfolio["holdings"][add_base_tk] = {
+                "shares": add_amount / add_entry_price,
+                "amount": add_amount,
+                "entry_price": add_entry_price,
+                "leveraged_ticker": add_lev_tk,
+                "entry_date": datetime.now().strftime("%Y-%m-%d"),
+            }
+            save_portfolio(edit_portfolio)
+            log_rebalance("MANUAL_ADD",
+                [(add_lev_tk, add_entry_price)],
+                spy_price, spy_ma,
+                calc_portfolio_value(edit_portfolio["holdings"], data),
+                effective_leverage, governor_active, spy_ok)
+            st.success(f"Added {add_lev_tk} at ${add_entry_price:.2f} for ${add_amount:,.0f}.")
+            st.rerun()
+
+    st.divider()
+
+    # ---- Edit an existing position's entry price ----
+    st.subheader("🔧 Fix an Entry Price")
+    st.write("Use this if the app recorded the wrong entry price for a position you're already holding.")
+
+    edit_positions = [tk for tk in edit_holdings.keys() if tk != CASH_PROXY]
+    if not edit_positions:
+        st.info("No positions saved yet.")
+    else:
+        fix_labels = {}
+        for tk in edit_positions:
+            lev_tk = edit_holdings[tk].get("leveraged_ticker", tk)
+            name = ASSETS.get(tk, (tk, "", None))[0]
+            current_entry = edit_holdings[tk].get("entry_price", 0)
+            fix_labels[f"{lev_tk} ({name}) — entry @ ${current_entry:.2f}"] = tk
+
+        fix_choice = st.selectbox("Which position needs fixing?", list(fix_labels.keys()), key="fix_select")
+        fix_tk = fix_labels[fix_choice]
+        fix_lev_tk = edit_holdings[fix_tk].get("leveraged_ticker", fix_tk)
+        current_entry = edit_holdings[fix_tk].get("entry_price", 0)
+        current_amount = edit_holdings[fix_tk].get("amount", 0)
+
+        fix_col1, fix_col2 = st.columns(2)
+        with fix_col1:
+            new_entry_price = st.number_input(
+                f"Correct entry price for {fix_lev_tk} ($)",
+                min_value=0.01, max_value=100000.0,
+                value=float(current_entry) if current_entry else 100.0,
+                step=0.01, key="fix_price"
+            )
+        with fix_col2:
+            new_amount = st.number_input(
+                "Correct dollar amount ($)",
+                min_value=1.0, max_value=1000000.0,
+                value=float(current_amount) if current_amount else 1000.0,
+                step=1.0, key="fix_amount"
+            )
+
+        if st.button(f"🔧 Update {fix_lev_tk} entry price", key="fix_btn"):
+            edit_portfolio["holdings"][fix_tk]["entry_price"] = new_entry_price
+            edit_portfolio["holdings"][fix_tk]["amount"] = new_amount
+            edit_portfolio["holdings"][fix_tk]["shares"] = new_amount / new_entry_price
+            save_portfolio(edit_portfolio)
+            st.success(f"Updated {fix_lev_tk}: entry price now ${new_entry_price:.2f}, amount ${new_amount:,.0f}.")
+            st.rerun()
+
+    st.divider()
+
+    # ---- Current holdings summary ----
+    st.subheader("📋 Current Holdings Summary")
+    if edit_holdings:
+        summary_data = []
+        for tk, info in edit_holdings.items():
+            if tk == CASH_PROXY:
+                summary_data.append({
+                    "Ticker": "SPAXX",
+                    "Name": "Cash",
+                    "Entry Price": "$1.00",
+                    "Amount": f"${info.get('amount', 0):,.0f}",
+                    "Entry Date": info.get("entry_date", "—"),
+                })
+            else:
+                lev_tk = info.get("leveraged_ticker", tk)
+                name = ASSETS.get(tk, (tk, "", None))[0]
+                entry = info.get("entry_price", 0)
+                amount = info.get("amount", 0)
+                summary_data.append({
+                    "Ticker": lev_tk,
+                    "Name": name,
+                    "Entry Price": f"${entry:.2f}" if entry else "—",
+                    "Amount": f"${amount:,.0f}" if amount else "—",
+                    "Entry Date": info.get("entry_date", "—"),
+                })
+        st.dataframe(pd.DataFrame(summary_data), use_container_width=True, hide_index=True)
+    else:
+        st.info("No holdings saved yet.")
