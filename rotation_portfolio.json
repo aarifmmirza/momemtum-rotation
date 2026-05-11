@@ -1,0 +1,48 @@
+{
+  "holdings": {
+    "XLK": {
+      "shares": 8.457492163009405,
+      "amount": 1348.97,
+      "entry_price": 159.5,
+      "base_entry_price": 159.5,
+      "leveraged_ticker": "XLK",
+      "entry_date": "2026-05-08"
+    },
+    "EEM": {
+      "shares": 14.635964453737584,
+      "amount": 1399.93,
+      "entry_price": 95.65,
+      "base_entry_price": 60.37,
+      "leveraged_ticker": "EET",
+      "entry_date": "2026-05-08"
+    },
+    "XLE": {
+      "shares": 24.301921162693862,
+      "amount": 1360.3,
+      "entry_price": 55.974998474121094,
+      "base_entry_price": 55.974998474121094,
+      "leveraged_ticker": "XLE",
+      "entry_date": "2026-05-08"
+    },
+    "QQQ": {
+      "shares": 15.33116094112449,
+      "amount": 1387.93,
+      "entry_price": 90.53,
+      "base_entry_price": 706.4400024414062,
+      "leveraged_ticker": "QLD",
+      "entry_date": "2026-05-08"
+    },
+    "IWM": {
+      "shares": 22.20423468461558,
+      "amount": 1337.25,
+      "entry_price": 60.224998474121094,
+      "base_entry_price": 283.0,
+      "leveraged_ticker": "UWM",
+      "entry_date": "2026-05-08"
+    }
+  },
+  "account_size": 7000,
+  "last_rebalance": "2026-05-08",
+  "equity_peak": 7510.119069132064,
+  "governor_active": false
+}
