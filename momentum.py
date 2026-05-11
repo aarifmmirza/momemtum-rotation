@@ -67,6 +67,23 @@ MA_PERIOD = 200
 CIRCUIT_BREAKER_PCT = 0.10   # 10% loss from entry → emergency sell
 GOVERNOR_THRESHOLD = 0.20    # 20% drawdown from peak → force 1x leverage
 
+# Circuit Breaker Measurement Mode
+# -----------------------------------------------------------------------------
+# When holding a 2x leveraged ETF (UWM, EET, QLD, etc.), do we measure the -10%
+# breaker against the BASE underlying or the LEVERAGED ETF we actually hold?
+#
+# Backtest comparison (1996-2026, all 3 modes produced identical 22.12% CAGR
+# because Variant E weekly rotation handles risk before stops fire):
+#   "BASE"      -  4 trips in 24yr, 50% recovery rate. Measures asset-class signal.
+#   "LEVERAGED" -  2 trips in 24yr, 100% recovery rate (i.e. 2/2 false alarms).
+#                  Whipsaws on routine 5% underlying moves amplified to 10% leveraged.
+#   "NONE"      -  No intra-week stops. Pure weekly rotation handles all risk.
+#
+# DECISION: BASE — measures what the strategy ranks (base tickers) for consistency.
+# Doesn't whipsaw on leverage amplification of normal volatility.
+# All three behave identically in the backtest, so this is a philosophy choice.
+BREAKER_MODE = "BASE"  # options: "BASE", "LEVERAGED", "NONE"
+
 # Variant E: Safe haven rotation during bear markets
 # When SPY < MA200, rotate into the best momentum safe haven at 1x
 SAFE_HAVENS = ["GLD", "TLT"]  # Gold and bonds — go UP during crashes
@@ -120,9 +137,12 @@ def log_rebalance(action, holdings_list, spy_price, spy_ma, account_val,
 
 @st.cache_data(ttl=1800)  # Cache 30 minutes
 def load_data():
-    """Download ~14 months of data for all assets."""
-    tickers = list(ASSETS.keys())
-    tickers = list(set(tickers))
+    """Download ~14 months of data for all assets AND their leveraged ETF counterparts."""
+    base_tickers = list(ASSETS.keys())
+    # Also fetch leveraged tickers so we can store the correct entry price
+    # when buying 2x positions like SSO, QLD, UWM, EET, UGL, UBT, URE, EFO
+    leveraged_tickers = [info[2] for info in ASSETS.values() if info[2]]
+    tickers = list(set(base_tickers + leveraged_tickers))
     end = datetime.now()
     start = end - timedelta(days=450)
 
@@ -207,9 +227,30 @@ def save_portfolio(p):
         json.dump(p, f, indent=2, default=str)
 
 
+def get_buy_price(buy_ticker, base_ticker, base_price, data):
+    """Return the actual price of the ticker being bought.
+
+    For 1x sectors (XLK, XLE, etc.) buy_ticker == base_ticker, so base_price is correct.
+    For 2x positions (UWM, EET, QLD, etc.) we MUST fetch the leveraged ticker's
+    real price. UWM ≠ IWM × 2 — it's an entirely different traded instrument.
+    Falling back to base_price would store a wildly wrong entry, breaking circuit breakers.
+    """
+    if buy_ticker == base_ticker:
+        return base_price
+    if buy_ticker in data and len(data[buy_ticker]) > 0:
+        return float(data[buy_ticker]["Close"].iloc[-1])
+    # Hard fallback: if leveraged data missing, return None so caller can flag the issue
+    return None
+
+
 def calc_portfolio_value(holdings, data):
     """Calculate true portfolio value from shares × current price.
-    SPAXX (money market) is always valued at the stored dollar amount."""
+    SPAXX (money market) is always valued at the stored dollar amount.
+
+    For 2x positions, we hold the leveraged ticker (e.g. UWM, EET) — not the base.
+    Must look up current price using leveraged_ticker, otherwise we'd multiply
+    UWM shares by IWM's price, which is meaningless.
+    """
     total = 0.0
     for tk, info in holdings.items():
         if tk == CASH_PROXY:
@@ -217,7 +258,12 @@ def calc_portfolio_value(holdings, data):
             total += info.get("amount", 0)
         else:
             shares = info.get("shares", 0)
-            if shares and tk in data:
+            # Use the actual ticker we hold (leveraged_ticker), fall back to base
+            price_tk = info.get("leveraged_ticker", tk)
+            if shares and price_tk in data:
+                total += shares * get_price(data[price_tk])
+            elif shares and tk in data:
+                # Fallback if leveraged data missing
                 total += shares * get_price(data[tk])
             elif info.get("amount"):
                 total += info["amount"]
@@ -305,9 +351,13 @@ with st.sidebar:
     st.header("⚙️ Settings")
     portfolio = load_portfolio()
 
+    # account_size is the SEED capital — only used when portfolio is empty.
+    # Once positions exist, the rebalance math uses LIVE portfolio value
+    # so target slot size grows with the portfolio (proper compounding).
     account_size = st.number_input(
-        "Account Size ($)", min_value=1000, max_value=10000000,
+        "Starting Capital ($) — used only if no positions yet", min_value=1000, max_value=10000000,
         value=int(portfolio.get("account_size", 6000)), step=500,
+        help="Once you have live holdings, the app calculates target slot size from your CURRENT portfolio value, not this number.",
     )
     portfolio["account_size"] = account_size
 
@@ -437,7 +487,35 @@ for r in rankings:
 
 cash_slots = TOP_N - len(selected)
 cash_weight = cash_slots / TOP_N if TOP_N > 0 else 0
-per_position = account_size / TOP_N
+
+# ===== LIVE PORTFOLIO VALUE COMPUTATION =====
+# CRITICAL: target slot size must grow with the portfolio for compounding to work.
+# Static "$1,400 per slot forever" would prevent the strategy from compounding past
+# its starting capital — exactly what destroys the backtest's 22% CAGR over 20 years.
+#
+# Logic:
+# - If we have live holdings → pilot_active_value = sum of current position values
+#   (excludes FGRTX, ALAYN reserves, anything outside the app's tracked holdings)
+# - If no holdings yet (fresh start) → fall back to seed account_size
+# - target_per_slot = pilot_active_value / TOP_N (5)
+#
+# Note: SPAXX inside the app's holdings counts as cash slot, included in pilot value.
+# But ALAYN reserve sitting in Fidelity SPAXX is NOT in the app — it's not tracked.
+current_holdings_for_value = portfolio.get("holdings", {})
+if current_holdings_for_value:
+    pilot_active_value = calc_portfolio_value(current_holdings_for_value, data)
+    # Safety: if calc returned 0 (data issue), fall back to seed value
+    if pilot_active_value <= 0:
+        pilot_active_value = float(account_size)
+        rebalance_basis_note = f"⚠️ Could not compute live value — using seed ${account_size:,}"
+    else:
+        rebalance_basis_note = f"Live pilot value (sum of current positions)"
+else:
+    # No holdings yet — first-time setup uses seed capital
+    pilot_active_value = float(account_size)
+    rebalance_basis_note = f"Initial seed (no positions yet)"
+
+per_position = pilot_active_value / TOP_N
 
 # ---- VARIANT E: Safe Haven Selection (bear market) ----
 bear_pick = None  # Will be set if SPY < MA200 and a safe haven has momentum
@@ -604,12 +682,14 @@ with tab_check:
             entry_price = info.get("entry_price")
             if entry_price is None or tk == CASH_PROXY:
                 continue
-            if tk not in data:
-                st.warning(f"⚠️ {tk} — could not fetch price")
+            # Use leveraged_ticker for current price lookup — that's what we actually hold.
+            # For sectors, leveraged_ticker == tk, so this works for both 1x and 2x.
+            price_tk = info.get("leveraged_ticker", tk)
+            if price_tk not in data:
+                st.warning(f"⚠️ {price_tk} — could not fetch price")
                 continue
 
-            current_price = get_price(data[tk])
-            pct_change = (current_price - entry_price) / entry_price
+            current_price = get_price(data[price_tk])
             shares = info.get("shares", 0)
             lev_tk = info.get("leveraged_ticker", tk)
             name = ASSETS.get(tk, (tk, "", None))[0]
@@ -618,8 +698,35 @@ with tab_check:
             entry_value = shares * entry_price if shares else info.get("amount", 0)
             gain_loss = pos_value - entry_value
 
-            if pct_change <= -CIRCUIT_BREAKER_PCT:
+            # === CIRCUIT BREAKER MEASUREMENT ===
+            # BASE mode: measure -10% on the underlying asset (IWM, EEM, XLK)
+            #            so leverage amplification doesn't whipsaw us out
+            # LEVERAGED:  measure -10% on the leveraged ETF itself (UWM, EET)
+            # NONE:      no intra-week breaker
+            base_entry_price = info.get("base_entry_price", entry_price)  # fallback for old saved data
+            base_current_price = get_price(data[tk]) if tk in data else current_price
+
+            if BREAKER_MODE == "BASE":
+                # Compare base ticker prices. For sectors, base==leveraged so result identical.
+                breaker_pct = (base_current_price - base_entry_price) / base_entry_price
+                breaker_label = f"{tk} (base)"
+            elif BREAKER_MODE == "LEVERAGED":
+                breaker_pct = (current_price - entry_price) / entry_price
+                breaker_label = f"{lev_tk} (held)"
+            else:  # NONE
+                breaker_pct = 0.0  # never trips
+                breaker_label = "disabled"
+
+            # Display % change is ALWAYS the leveraged-ticker change (what user sees in Fidelity)
+            display_pct = (current_price - entry_price) / entry_price
+
+            tripped = breaker_pct <= -CIRCUIT_BREAKER_PCT and BREAKER_MODE != "NONE"
+
+            if tripped:
                 any_tripped = True
+                breaker_explainer = ""
+                if BREAKER_MODE == "BASE" and tk != lev_tk:
+                    breaker_explainer = f"<br><span style='font-size:12px;color:#ffaaaa;'>Base {tk} dropped {breaker_pct:+.1%} (your held {lev_tk}: {display_pct:+.1%}).</span>"
                 st.markdown(f"""
                 <div class="sell-signal">
                     <div class="action-header" style="color: #F44336; font-size: 16px;">
@@ -631,8 +738,9 @@ with tab_check:
                     <div style="font-size: 14px; margin-top: 8px;">
                         Entry: ${entry_price:.2f} → Now: ${current_price:.2f}
                         &nbsp;|&nbsp;
-                        <span style="color: #F44336; font-weight: bold;">{pct_change:+.1%}</span>
+                        <span style="color: #F44336; font-weight: bold;">{display_pct:+.1%}</span>
                         &nbsp;|&nbsp; Loss: ${gain_loss:,.0f}
+                        {breaker_explainer}
                     </div>
                     <div style="font-size: 13px; margin-top: 8px; color: #ff9999;">
                         <b>ACTION:</b> Sell {lev_tk} now. Park in SPAXX until next rebalance.
@@ -640,8 +748,14 @@ with tab_check:
                 </div>
                 """, unsafe_allow_html=True)
             else:
-                gl_color = "#4CAF50" if pct_change >= 0 else "#FF9800"
-                breaker_price = entry_price * (1 - CIRCUIT_BREAKER_PCT)
+                gl_color = "#4CAF50" if display_pct >= 0 else "#FF9800"
+                # Show stop level in the ticker user is monitoring
+                if BREAKER_MODE == "BASE":
+                    stop_level_str = f"Base {tk} @ ${base_entry_price * (1 - CIRCUIT_BREAKER_PCT):.2f} stop ({-CIRCUIT_BREAKER_PCT:.0%})"
+                elif BREAKER_MODE == "LEVERAGED":
+                    stop_level_str = f"Stop @ ${entry_price * (1 - CIRCUIT_BREAKER_PCT):.2f} ({-CIRCUIT_BREAKER_PCT:.0%})"
+                else:
+                    stop_level_str = "No intra-week stop (relies on weekly rotation)"
                 st.markdown(f"""
                 <div class="hold-signal">
                     <div style="display: flex; justify-content: space-between; align-items: center;">
@@ -651,7 +765,7 @@ with tab_check:
                         </div>
                         <div style="text-align: right;">
                             <span style="color: {gl_color}; font-size: 18px; font-weight: bold;">
-                                {pct_change:+.1%}
+                                {display_pct:+.1%}
                             </span>
                             <span style="color: #888; font-size: 12px; margin-left: 8px;">
                                 (${gain_loss:+,.0f})
@@ -660,7 +774,7 @@ with tab_check:
                     </div>
                     <div style="font-size: 11px; color: #666; margin-top: 4px;">
                         Entry: ${entry_price:.2f} → Now: ${current_price:.2f}
-                        &nbsp;|&nbsp; Stop at ${breaker_price:.2f} ({-CIRCUIT_BREAKER_PCT:.0%})
+                        &nbsp;|&nbsp; {stop_level_str}
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
@@ -739,6 +853,27 @@ with tab_check:
 with tab_rebalance:
     st.header(f"📊 Rebalance — {datetime.now().strftime('%B %d, %Y')}")
 
+    # Show what's driving the rebalance math
+    # Use HTML directly since markdown parser mangles dollar signs + asterisks
+    if current_holdings_for_value:
+        st.markdown(
+            f'<div style="color:#888;font-size:13px;padding:8px 0;">'
+            f'💰 <b>Pilot active value: ${pilot_active_value:,.0f}</b> '
+            f'(sum of current 5 positions). '
+            f'Target per slot: <b>${per_position:,.0f}</b> (20% each). '
+            f'Excludes FGRTX and any reserves outside the app.'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+    else:
+        st.markdown(
+            f'<div style="color:#888;font-size:13px;padding:8px 0;">'
+            f'💰 <b>Starting capital: ${pilot_active_value:,.0f}</b> (seed — no holdings yet). '
+            f'Target per slot: <b>${per_position:,.0f}</b> (20% each).'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+
     # Show effective leverage
     if governor_active:
         st.markdown(f"""
@@ -752,6 +887,7 @@ with tab_rebalance:
     if not spy_ok:
         if bear_pick:
             # Variant E: Safe haven rotation
+            # In bear mode, full pilot value goes into the safe haven (1x, single position)
             st.warning(f"⚠️ SPY below MA200 — **BEAR MODE**. Rotating into safe haven: "
                        f"**{bear_pick['ticker']}** ({bear_pick['name']}) at 1x leverage.")
             st.markdown(f"""
@@ -760,9 +896,9 @@ with tab_rebalance:
                 <div style="font-size: 36px; margin: 8px 0;">{bear_pick['emoji']}</div>
                 <div class="ticker-big">{bear_pick['ticker']}</div>
                 <div style="color: #888; font-size: 14px;">{bear_pick['name']} (1x — no leverage in bear mode)</div>
-                <div class="amount-big">${account_size:,.0f}</div>
+                <div class="amount-big">${pilot_active_value:,.0f}</div>
                 <div style="color: #888; font-size: 12px;">
-                    ≈ {account_size / bear_pick['price']:.1f} shares @ ${bear_pick['price']:.2f}
+                    ≈ {pilot_active_value / bear_pick['price']:.1f} shares @ ${bear_pick['price']:.2f}
                 </div>
                 <div style="color: #FF9800; font-size: 16px; margin-top: 8px;">
                     Momentum: {bear_pick['momentum']:.1%} | 1-month: {bear_pick['ret_1m']:+.1%}
@@ -776,9 +912,10 @@ with tab_rebalance:
             if st.button(f"✅ I've bought {bear_pick['ticker']} — Save holdings", type="primary", key="bear_haven_save"):
                 portfolio["holdings"] = {
                     bear_pick["ticker"]: {
-                        "shares": account_size / bear_pick["price"],
-                        "amount": account_size,
+                        "shares": pilot_active_value / bear_pick["price"],
+                        "amount": pilot_active_value,
                         "entry_price": bear_pick["price"],
+                        "base_entry_price": bear_pick["price"],
                         "leveraged_ticker": bear_pick["ticker"],
                         "entry_date": datetime.now().strftime("%Y-%m-%d"),
                     }
@@ -799,7 +936,7 @@ with tab_rebalance:
             st.markdown(f"""
             <div class="sell-signal">
                 <div class="action-header" style="color: #F44336;">BEAR MODE — ALL CASH</div>
-                <div class="amount-big">${account_size:,.0f} → SPAXX</div>
+                <div class="amount-big">${pilot_active_value:,.0f} → SPAXX</div>
                 <div style="color: #888; font-size: 13px;">
                     SPY: ${spy_price:.2f} | MA200: ${spy_ma:.2f} | GLD & TLT: no positive momentum
                 </div>
@@ -809,9 +946,10 @@ with tab_rebalance:
             if st.button("✅ I've moved everything to SPAXX", type="primary", key="bear_save"):
                 portfolio["holdings"] = {
                     CASH_PROXY: {
-                        "shares": account_size,
-                        "amount": account_size,
+                        "shares": pilot_active_value,
+                        "amount": pilot_active_value,
                         "entry_price": None,
+                        "base_entry_price": None,
                         "leveraged_ticker": CASH_PROXY,
                         "entry_date": datetime.now().strftime("%Y-%m-%d"),
                     }
@@ -863,16 +1001,18 @@ with tab_rebalance:
             cols = st.columns(min(len(selected), 5))
             for i, pick in enumerate(selected):
                 with cols[i]:
-                    # Get the leveraged ticker price for share calculation
+                    # Get the ACTUAL price of the ticker we're buying
+                    # For 2x positions this is critical — UWM/EET/QLD etc. trade at
+                    # their own prices, not the base ETF price
                     buy_tk = pick["buy_ticker"]
-                    if buy_tk != pick["ticker"] and buy_tk in [ASSETS[t][2] for t in ASSETS if ASSETS[t][2]]:
-                        # We need the leveraged ETF price — fetch it
-                        # For now use base price (user sees dollar amount, that's what matters)
-                        display_price = pick["price"]
-                    else:
-                        display_price = pick["price"]
+                    actual_buy_price = get_buy_price(buy_tk, pick["ticker"], pick["price"], data)
+                    if actual_buy_price is None:
+                        # Leveraged data missing — fall back to base but warn
+                        actual_buy_price = pick["price"]
+                        st.warning(f"⚠️ Could not load price for {buy_tk}. Using base ticker price as fallback. Verify entry in Edit Holdings after trade.")
 
-                    shares_est = per_position / display_price
+                    pick["buy_price"] = actual_buy_price  # stash for save logic
+                    shares_est = per_position / actual_buy_price
                     lev_badge = f'<span style="background:#FF9800;color:#000;padding:2px 6px;border-radius:4px;font-size:11px;">{pick["lev_label"]}</span>' if pick["lev_label"] == "2x" else f'<span style="background:#2196F3;color:#fff;padding:2px 6px;border-radius:4px;font-size:11px;">1x</span>'
 
                     color = "#4CAF50" if pick["ret_1m"] > 0 else "#F44336"
@@ -883,6 +1023,9 @@ with tab_rebalance:
                         <div style="color: #888; font-size: 13px;">{pick['name']} {lev_badge}</div>
                         <div class="amount-big">${per_position:,.0f}</div>
                         <div style="color: #888; font-size: 12px;">
+                            {pick['buy_ticker']} @ ${actual_buy_price:.2f} ≈ {shares_est:.1f} sh
+                        </div>
+                        <div style="color: #666; font-size: 11px;">
                             Base: {pick['ticker']} @ ${pick['price']:.2f}
                         </div>
                         <div style="color: {color}; font-size: 16px; margin-top: 6px;">
@@ -895,7 +1038,7 @@ with tab_rebalance:
                     """, unsafe_allow_html=True)
 
         if cash_slots > 0:
-            cash_amount = account_size * cash_weight
+            cash_amount = pilot_active_value * cash_weight
             st.warning(f"⚠️ {cash_slots} slot(s) → **SPAXX (Cash)** — ${cash_amount:,.0f}. "
                        f"Not enough assets passed filters.")
 
@@ -967,85 +1110,131 @@ with tab_rebalance:
                     <div class="action-header" style="color: #2196F3;">BUY</div>
                     <div class="ticker-big">SPAXX</div>
                     <div style="color: #888;">Cash (Short-term Treasuries)</div>
-                    <div class="amount-big">${account_size * cash_weight:,.0f}</div>
+                    <div class="amount-big">${pilot_active_value * cash_weight:,.0f}</div>
                 </div>
                 """, unsafe_allow_html=True)
-        elif not sells and not buys and not leverage_swaps:
-            # Check if leverage changed (governor toggled)
-            st.success("✅ **Same positions as last week.** No trades needed.")
-            if governor_active:
-                st.info("ℹ️ Governor is active. If you're still holding 2x ETFs from before "
-                        "the governor triggered, consider swapping to 1x equivalents on this rebalance.")
         else:
-            action_cols = st.columns(2)
-            with action_cols[0]:
-                has_sells = bool(sells) or bool(leverage_swaps)
-                if sells or leverage_swaps:
-                    for tk in sells:
-                        name = ASSETS.get(tk, (tk, "", None))[0]
-                        old_lev = current_holdings.get(tk, {}).get("leveraged_ticker", tk)
-                        st.markdown(f"""
-                        <div class="sell-signal">
-                            <div class="action-header" style="color: #F44336;">SELL ALL</div>
-                            <div class="ticker-big">{old_lev}</div>
-                            <div style="color: #888;">{name}</div>
-                        </div>
-                        """, unsafe_allow_html=True)
-                    for tk in leverage_swaps:
-                        name = ASSETS.get(tk, (tk, "", None))[0]
-                        old_lev = current_holdings.get(tk, {}).get("leveraged_ticker", tk)
-                        new_pick = new_tickers.get(tk)
-                        new_lev = new_pick["buy_ticker"] if new_pick else tk
-                        st.markdown(f"""
-                        <div class="sell-signal">
-                            <div class="action-header" style="color: #FF9800;">SWAP — SELL</div>
-                            <div class="ticker-big">{old_lev} → {new_lev}</div>
-                            <div style="color: #888;">{name} — switching from {old_lev} (bear mode) to {new_lev} (bull mode)</div>
-                        </div>
-                        """, unsafe_allow_html=True)
-                else:
-                    st.success("Nothing to sell")
-
-            with action_cols[1]:
-                if buys or leverage_swaps:
-                    for tk in buys:
-                        pick = new_tickers.get(tk)
-                        if pick:
+            # We have existing holdings — show SELL / BUY / SWAP first, then TRIM/ADD for kept positions
+            if not sells and not buys and not leverage_swaps:
+                st.success("✅ **Same tickers as last week.** No new positions to buy or sell — but check rebalance drift below.")
+                if governor_active:
+                    st.info("ℹ️ Governor is active. If you're still holding 2x ETFs from before "
+                            "the governor triggered, consider swapping to 1x equivalents on this rebalance.")
+            else:
+                action_cols = st.columns(2)
+                with action_cols[0]:
+                    has_sells = bool(sells) or bool(leverage_swaps)
+                    if sells or leverage_swaps:
+                        for tk in sells:
+                            name = ASSETS.get(tk, (tk, "", None))[0]
+                            old_lev = current_holdings.get(tk, {}).get("leveraged_ticker", tk)
                             st.markdown(f"""
-                            <div class="buy-signal">
-                                <div class="action-header" style="color: #4CAF50;">BUY</div>
-                                <div class="ticker-big">{pick['buy_ticker']}</div>
-                                <div style="color: #888;">{pick['name']} ({pick['lev_label']})</div>
-                                <div class="amount-big">${per_position:,.0f}</div>
+                            <div class="sell-signal">
+                                <div class="action-header" style="color: #F44336;">SELL ALL</div>
+                                <div class="ticker-big">{old_lev}</div>
+                                <div style="color: #888;">{name}</div>
                             </div>
                             """, unsafe_allow_html=True)
-                    for tk in leverage_swaps:
-                        pick = new_tickers.get(tk)
-                        if pick:
+                        for tk in leverage_swaps:
+                            name = ASSETS.get(tk, (tk, "", None))[0]
+                            old_lev = current_holdings.get(tk, {}).get("leveraged_ticker", tk)
+                            new_pick = new_tickers.get(tk)
+                            new_lev = new_pick["buy_ticker"] if new_pick else tk
                             st.markdown(f"""
-                            <div class="buy-signal">
-                                <div class="action-header" style="color: #FF9800;">SWAP — BUY</div>
-                                <div class="ticker-big">{pick['buy_ticker']}</div>
-                                <div style="color: #888;">{pick['name']} ({pick['lev_label']}) — replacing bear mode position</div>
-                                <div class="amount-big">${per_position:,.0f}</div>
+                            <div class="sell-signal">
+                                <div class="action-header" style="color: #FF9800;">SWAP — SELL</div>
+                                <div class="ticker-big">{old_lev} → {new_lev}</div>
+                                <div style="color: #888;">{name} — switching from {old_lev} (bear mode) to {new_lev} (bull mode)</div>
                             </div>
                             """, unsafe_allow_html=True)
-                else:
-                    st.success("Nothing to buy")
+                    else:
+                        st.success("Nothing to sell")
 
+                with action_cols[1]:
+                    if buys or leverage_swaps:
+                        for tk in buys:
+                            pick = new_tickers.get(tk)
+                            if pick:
+                                st.markdown(f"""
+                                <div class="buy-signal">
+                                    <div class="action-header" style="color: #4CAF50;">BUY</div>
+                                    <div class="ticker-big">{pick['buy_ticker']}</div>
+                                    <div style="color: #888;">{pick['name']} ({pick['lev_label']})</div>
+                                    <div class="amount-big">${per_position:,.0f}</div>
+                                </div>
+                                """, unsafe_allow_html=True)
+                        for tk in leverage_swaps:
+                            pick = new_tickers.get(tk)
+                            if pick:
+                                st.markdown(f"""
+                                <div class="buy-signal">
+                                    <div class="action-header" style="color: #FF9800;">SWAP — BUY</div>
+                                    <div class="ticker-big">{pick['buy_ticker']}</div>
+                                    <div style="color: #888;">{pick['name']} ({pick['lev_label']}) — replacing bear mode position</div>
+                                    <div class="amount-big">${per_position:,.0f}</div>
+                                </div>
+                                """, unsafe_allow_html=True)
+                    else:
+                        st.success("Nothing to buy")
+
+            # ===== TRIM/ADD/HOLD logic for positions we keep =====
+            # This runs in BOTH branches above — whether we have buys/sells or not.
+            # Critical: a "same tickers" week still needs drift correction to maintain equal weight.
             if true_holds:
-                st.markdown("**HOLD (no change):**")
+                st.markdown("**HOLD / REBALANCE TO TARGET:**")
+                st.caption(f"Target per slot: ${per_position:,.0f} ({rebalance_basis_note}). "
+                           f"Trim winners and top up underweights to maintain equal weight.")
                 for tk in true_holds:
                     pick = new_tickers.get(tk)
                     name = ASSETS.get(tk, (tk, "", None))[0]
                     lev_tk = pick["buy_ticker"] if pick else tk
-                    st.markdown(f"""
-                    <div class="hold-signal">
-                        <div class="action-header" style="color: #2196F3;">HOLD</div>
-                        <span class="ticker-big">{lev_tk}</span>
-                        <span style="color: #888; margin-left: 10px;">{name}</span>
-                    </div>
-                    """, unsafe_allow_html=True)
+                    # Compute current value of this held position using leveraged ticker price
+                    holding_info = current_holdings.get(tk, {})
+                    held_shares = holding_info.get("shares", 0)
+                    held_price_tk = holding_info.get("leveraged_ticker", tk)
+                    if held_price_tk in data:
+                        held_current_price = get_price(data[held_price_tk])
+                        current_value = held_shares * held_current_price
+                    else:
+                        current_value = holding_info.get("amount", per_position)
+                        held_current_price = 0
+
+                    delta = per_position - current_value  # positive = need to ADD, negative = TRIM
+                    drift_pct = (current_value - per_position) / per_position if per_position > 0 else 0
+                    abs_delta = abs(delta)
+
+                    DRIFT_THRESHOLD = 0.03  # 3% — don't churn on tiny drifts
+                    if abs(drift_pct) < DRIFT_THRESHOLD:
+                        			action_label = "HOLD"
+                        			action_color = "#2196F3"
+                        			action_detail = f"At target (${current_value:,.0f} of ${per_position:,.0f})"
+                        			action_amount_html = ""
+                    elif delta < 0:
+                        action_label = "TRIM"
+                        action_color = "#FF9800"
+                        shares_to_sell = abs_delta / held_current_price if held_current_price > 0 else 0
+                        action_detail = (f"Currently ${current_value:,.0f} ({drift_pct:+.1%} from target). "
+                                         f"Sell ~{shares_to_sell:.1f} shares.")
+                        action_amount_html = f'<div class="amount-big" style="color:#FF9800;">SELL ${abs_delta:,.0f}</div>'
+                    else:
+                        action_label = "ADD"
+                        action_color = "#4CAF50"
+                        shares_to_buy = abs_delta / held_current_price if held_current_price > 0 else 0
+                        action_detail = (f"Currently ${current_value:,.0f} ({drift_pct:+.1%} from target). "
+                                         f"Buy ~{shares_to_buy:.1f} more shares.")
+                        action_amount_html = f'<div class="amount-big" style="color:#4CAF50;">BUY ${abs_delta:,.0f}</div>'
+
+                    amount_section = action_amount_html if action_amount_html else ""
+                    st.markdown(
+                       				 f'<div class="hold-signal">'
+                        				f'<div class="action-header" style="color: {action_color};">{action_label}</div>'
+                        				f'<span class="ticker-big">{lev_tk}</span>'
+                       				 f'<span style="color: #888; margin-left: 10px;">{name}</span>'
+                        				f'{amount_section}'
+                       				 f'<div style="color: #888; font-size: 12px; margin-top: 4px;">{action_detail}</div>'
+                       				 f'</div>',
+                        				unsafe_allow_html=True
+                    			)
 
         # ---- Save Button ----
         st.divider()
@@ -1058,23 +1247,32 @@ with tab_rebalance:
         if (is_rebalance_day or override) and st.button("✅ I've made the trades — Save holdings", type="primary", key="save_rebal"):
             saved = {}
             for pick in selected:
-                tk = pick["ticker"]
-                price = pick["price"]
-                buy_tk = pick["buy_ticker"]
-                shares = per_position / price  # Shares in base ETF for tracking
+                tk = pick["ticker"]              # base ticker (IWM, EEM, XLK, etc.)
+                buy_tk = pick["buy_ticker"]      # what we actually hold (UWM, EET, XLK)
+                # Store BOTH prices:
+                #   entry_price       = leveraged ticker price (for portfolio value math)
+                #   base_entry_price  = base ticker price (for BreakerOnBase calculation)
+                # For 1x sectors, base_entry_price == entry_price (same ticker).
+                buy_price = pick.get("buy_price")
+                if buy_price is None or buy_price <= 0:
+                    buy_price = pick["price"]
+                base_price = pick["price"]       # always the base/ranking ticker price
+                shares = per_position / buy_price
                 saved[tk] = {
                     "shares": shares,
                     "amount": per_position,
-                    "entry_price": price,
+                    "entry_price": buy_price,
+                    "base_entry_price": base_price,
                     "leveraged_ticker": buy_tk,
                     "entry_date": datetime.now().strftime("%Y-%m-%d"),
                 }
             if cash_slots > 0:
-                cash_amt = account_size * cash_weight
+                cash_amt = pilot_active_value * cash_weight
                 saved[CASH_PROXY] = {
                     "shares": cash_amt,
                     "amount": cash_amt,
                     "entry_price": None,
+                    "base_entry_price": None,
                     "leveraged_ticker": CASH_PROXY,
                     "entry_date": datetime.now().strftime("%Y-%m-%d"),
                 }
@@ -1091,7 +1289,7 @@ with tab_rebalance:
 
             save_portfolio(portfolio)
             log_rebalance("REBALANCE",
-                [(pick["buy_ticker"], pick["price"]) for pick in selected],
+                [(pick["buy_ticker"], pick.get("buy_price", pick["price"])) for pick in selected],
                 spy_price, spy_ma, new_val, effective_leverage, governor_active, spy_ok)
             next_fri = datetime.now() + timedelta(days=(4 - datetime.now().weekday()) % 7 or 7)
             st.success(f"Saved! Next rebalance: {next_fri.strftime('%A, %B %d')}")
@@ -1126,7 +1324,7 @@ with tab_rebalance:
         **BULL MODE (SPY above MA200):**
         1. Rank all 17 assets by momentum (60% × 3mo + 40% × 6mo return)
         2. Pick the top 5 with POSITIVE momentum AND above 200-day MA
-        3. Equal weight: 20% of account per position (${account_size/5:,.0f} each)
+        3. Equal weight: 20% of pilot active value per position (currently **${per_position:,.0f}** each)
         4. Broad assets use 2x leveraged ETFs, sectors stay 1x
 
         **BEAR MODE (SPY below MA200):**
@@ -1225,27 +1423,56 @@ with tab_edit:
         add_info = ASSETS[add_base_tk]
         add_lev_tk = add_info[2] if add_info[2] else add_base_tk
 
+        # Show persistent success message from previous add (survives st.rerun)
+        if "add_success_msg" in st.session_state and st.session_state["add_success_msg"]:
+            st.success(st.session_state["add_success_msg"])
+            st.session_state["add_success_msg"] = None
+
         add_col1, add_col2 = st.columns(2)
         with add_col1:
+            # User enters the price they actually paid for the leveraged ticker (UWM, EET, etc.)
+            # If they're holding a 1x sector, leveraged ticker == base ticker.
+            default_lev_price = 100.0
+            if add_lev_tk in data:
+                default_lev_price = float(get_price(data[add_lev_tk]))
+            elif add_base_tk in data:
+                default_lev_price = float(get_price(data[add_base_tk]))
+            # Dynamic key per ticker so values reset between selections
             add_entry_price = st.number_input(
-                f"Entry price for {add_lev_tk} ($)",
+                f"Entry price for {add_lev_tk} ($) — what you paid in Fidelity",
                 min_value=0.01, max_value=100000.0,
-                value=float(get_price(data[add_base_tk])) if add_base_tk in data else 100.0,
-                step=0.01, key="add_price"
+                value=default_lev_price,
+                step=0.01, key=f"add_price_{add_base_tk}"
             )
         with add_col2:
             add_amount = st.number_input(
                 "Dollar amount invested ($)",
                 min_value=1.0, max_value=1000000.0,
                 value=float(edit_portfolio.get("account_size", 6000) / TOP_N),
-                step=1.0, key="add_amount"
+                step=1.0, key=f"add_amount_{add_base_tk}"
             )
 
-        if st.button(f"➕ Add {add_lev_tk} to holdings", type="primary", key="add_btn"):
+        # Base entry price (for BreakerOnBase). Auto-fetched from current data if available.
+        if add_lev_tk == add_base_tk:
+            add_base_price_default = add_entry_price
+        elif add_base_tk in data:
+            add_base_price_default = float(get_price(data[add_base_tk]))
+        else:
+            add_base_price_default = add_entry_price
+        add_base_price = st.number_input(
+            f"Base ticker entry price for {add_base_tk} ($) — used for BreakerOnBase",
+            min_value=0.01, max_value=100000.0,
+            value=add_base_price_default,
+            step=0.01, key=f"add_base_price_{add_base_tk}",
+            help=f"For 2x positions, the breaker fires when {add_base_tk} drops 10% from this price (not when {add_lev_tk} drops 10%)."
+        )
+
+        if st.button(f"➕ Add {add_lev_tk} to holdings", type="primary", key=f"add_btn_{add_base_tk}"):
             edit_portfolio["holdings"][add_base_tk] = {
                 "shares": add_amount / add_entry_price,
                 "amount": add_amount,
                 "entry_price": add_entry_price,
+                "base_entry_price": add_base_price,
                 "leveraged_ticker": add_lev_tk,
                 "entry_date": datetime.now().strftime("%Y-%m-%d"),
             }
@@ -1255,7 +1482,10 @@ with tab_edit:
                 spy_price, spy_ma,
                 calc_portfolio_value(edit_portfolio["holdings"], data),
                 effective_leverage, governor_active, spy_ok)
-            st.success(f"Added {add_lev_tk} at ${add_entry_price:.2f} for ${add_amount:,.0f}.")
+            st.session_state["add_success_msg"] = (
+                f"✓ Added {add_lev_tk} at ${add_entry_price:.2f} "
+                f"(base {add_base_tk} @ ${add_base_price:.2f}) for ${add_amount:,.0f}."
+            )
             st.rerun()
 
     st.divider()
@@ -1263,6 +1493,12 @@ with tab_edit:
     # ---- Edit an existing position's entry price ----
     st.subheader("🔧 Fix an Entry Price")
     st.write("Use this if the app recorded the wrong entry price for a position you're already holding.")
+
+    # Show persistent success message from previous save (survives st.rerun)
+    if "fix_success_msg" in st.session_state and st.session_state["fix_success_msg"]:
+        st.success(st.session_state["fix_success_msg"])
+        # Clear it after showing once so it doesn't linger forever
+        st.session_state["fix_success_msg"] = None
 
     edit_positions = [tk for tk in edit_holdings.keys() if tk != CASH_PROXY]
     if not edit_positions:
@@ -1279,30 +1515,55 @@ with tab_edit:
         fix_tk = fix_labels[fix_choice]
         fix_lev_tk = edit_holdings[fix_tk].get("leveraged_ticker", fix_tk)
         current_entry = edit_holdings[fix_tk].get("entry_price", 0)
+        current_base_entry = edit_holdings[fix_tk].get("base_entry_price", current_entry)
         current_amount = edit_holdings[fix_tk].get("amount", 0)
 
+        # CRITICAL: include fix_tk in widget keys so each position has its OWN state.
+        # Without this, Streamlit reuses the same widget across position selections,
+        # causing the previous position's typed values to "stick" when you switch.
         fix_col1, fix_col2 = st.columns(2)
         with fix_col1:
             new_entry_price = st.number_input(
-                f"Correct entry price for {fix_lev_tk} ($)",
+                f"Correct entry price for {fix_lev_tk} ($) — what Fidelity shows",
                 min_value=0.01, max_value=100000.0,
                 value=float(current_entry) if current_entry else 100.0,
-                step=0.01, key="fix_price"
+                step=0.01, key=f"fix_price_{fix_tk}"
             )
         with fix_col2:
             new_amount = st.number_input(
                 "Correct dollar amount ($)",
                 min_value=1.0, max_value=1000000.0,
                 value=float(current_amount) if current_amount else 1000.0,
-                step=1.0, key="fix_amount"
+                step=1.0, key=f"fix_amount_{fix_tk}"
             )
 
-        if st.button(f"🔧 Update {fix_lev_tk} entry price", key="fix_btn"):
+        # Base entry price for BreakerOnBase. For 1x sectors, leveraged == base.
+        if fix_tk == fix_lev_tk:
+            new_base_entry = new_entry_price
+            st.caption(f"This is a 1x sector position — base entry = entry price (${new_entry_price:.2f}).")
+        else:
+            base_default = float(current_base_entry) if current_base_entry else (
+                float(get_price(data[fix_tk])) if fix_tk in data else 100.0
+            )
+            new_base_entry = st.number_input(
+                f"Correct base entry price for {fix_tk} ($) — used for BreakerOnBase",
+                min_value=0.01, max_value=100000.0,
+                value=base_default,
+                step=0.01, key=f"fix_base_price_{fix_tk}",
+                help=f"For 2x positions, the breaker fires when {fix_tk} drops 10% from this price."
+            )
+
+        if st.button(f"🔧 Update {fix_lev_tk} entry price", key=f"fix_btn_{fix_tk}"):
             edit_portfolio["holdings"][fix_tk]["entry_price"] = new_entry_price
+            edit_portfolio["holdings"][fix_tk]["base_entry_price"] = new_base_entry
             edit_portfolio["holdings"][fix_tk]["amount"] = new_amount
             edit_portfolio["holdings"][fix_tk]["shares"] = new_amount / new_entry_price
             save_portfolio(edit_portfolio)
-            st.success(f"Updated {fix_lev_tk}: entry price now ${new_entry_price:.2f}, amount ${new_amount:,.0f}.")
+            # Stash success message in session_state so it survives the rerun
+            st.session_state["fix_success_msg"] = (
+                f"✓ Updated {fix_lev_tk}: entry ${new_entry_price:.2f}, "
+                f"base {fix_tk} @ ${new_base_entry:.2f}, amount ${new_amount:,.0f}."
+            )
             st.rerun()
 
     st.divider()
